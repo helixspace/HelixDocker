@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+
+import os
+import json
+import subprocess
+import signal
+import shutil
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+CONTAINERS_DIR = os.path.join(BASE_DIR, "containers")
+DATA_FILE = os.path.join(BASE_DIR, "data", "containers.json")
+
+os.makedirs(CONTAINERS_DIR, exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
+
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def create_container(name, image_path=None):
+    path = os.path.join(CONTAINERS_DIR, name)
+    if os.path.exists(path):
+        print(f"Container {name} already exists.")
+        return
+    os.makedirs(path)
+    os.makedirs(os.path.join(path, "rootfs"))
+    if image_path and os.path.isfile(image_path):
+        subprocess.run(["tar", "-xf", image_path, "-C", os.path.join(path, "rootfs")])
+    limits = {
+        "cpu": 50,
+        "memory": 256,
+        "disk": 500
+    }
+    with open(os.path.join(path, "limits.json"), "w") as f:
+        json.dump(limits, f, indent=2)
+    with open(os.path.join(path, "run.sh"), "w") as f:
+        f.write("#!/bin/bash\n")
+        f.write(f"echo Hello from container {name}\n")
+        f.write("sleep 60\n")
+    os.chmod(os.path.join(path, "run.sh"), 0o755)
+    data = load_data()
+    data[name] = {"status": "stopped", "pid": None}
+    save_data(data)
+    print(f"Container {name} created.")
+
+def run_container(name):
+    data = load_data()
+    if name not in data:
+        print("No such container.")
+        return
+    if data[name]["status"] == "running":
+        print("Already running.")
+        return
+    path = os.path.join(CONTAINERS_DIR, name)
+    limits_path = os.path.join(path, "limits.json")
+    with open(limits_path) as f:
+        limits = json.load(f)
+    run_path = os.path.join(path, "run.sh")
+    cpu_limit = f"cpulimit -l {limits['cpu']} --"
+    mem_limit = f"ulimit -v {limits['memory'] * 1024} &&"
+    cmd = f"bash -c '{mem_limit} {cpu_limit} {run_path}'"
+    proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid)
+    data[name] = {"status": "running", "pid": proc.pid}
+    save_data(data)
+    print(f"Container {name} started with PID {proc.pid}.")
+
+def stop_container(name):
+    data = load_data()
+    if name not in data or data[name]["status"] != "running":
+        print("Not running.")
+        return
+    pid = data[name]["pid"]
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        data[name]["status"] = "stopped"
+        data[name]["pid"] = None
+        save_data(data)
+        print(f"Container {name} stopped.")
+    except ProcessLookupError:
+        data[name]["status"] = "stopped"
+        data[name]["pid"] = None
+        save_data(data)
+        print("Process already dead. Marked as stopped.")
+
+def list_containers():
+    data = load_data()
+    print("Name\t\tStatus\t\tPID")
+    for name, info in data.items():
+        print(f"{name}\t\t{info['status']}\t\t{info['pid']}")
+
+def check_disk_usage(container_name):
+    path = os.path.join(CONTAINERS_DIR, container_name, "rootfs")
+    limits_path = os.path.join(CONTAINERS_DIR, container_name, "limits.json")
+    with open(limits_path) as f:
+        limits = json.load(f)
+    disk_limit = limits.get("disk", 500) * 1024 * 1024
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if os.path.isfile(fp):
+                total += os.path.getsize(fp)
+    print(f"Disk used: {total} / {disk_limit} bytes")
+
+def mount_volume(container_name, host_path, container_path):
+    rootfs_path = os.path.join(CONTAINERS_DIR, container_name, "rootfs")
+    full_container_path = os.path.join(rootfs_path, container_path.lstrip("/"))
+    os.makedirs(os.path.dirname(full_container_path), exist_ok=True)
+    if os.path.exists(full_container_path):
+        os.remove(full_container_path)
+    os.symlink(host_path, full_container_path)
+    print(f"Mounted {host_path} into container {container_name} at {container_path}")
+
+def help():
+    print("HelixDocker CLI")
+    print("Usage:")
+    print("  helixdocker create <name> [image.tar.gz]")
+    print("  helixdocker run <name>")
+    print("  helixdocker stop <name>")
+    print("  helixdocker list")
+    print("  helixdocker disk <name>")
+    print("  helixdocker mount <name> <host_path> <container_path>")
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        help()
+    else:
+        cmd = sys.argv[1]
+        if cmd == "create" and len(sys.argv) >= 3:
+            create_container(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
+        elif cmd == "run" and len(sys.argv) == 3:
+            run_container(sys.argv[2])
+        elif cmd == "stop" and len(sys.argv) == 3:
+            stop_container(sys.argv[2])
+        elif cmd == "list":
+            list_containers()
+        elif cmd == "disk" and len(sys.argv) == 3:
+            check_disk_usage(sys.argv[2])
+        elif cmd == "mount" and len(sys.argv) == 5:
+            mount_volume(sys.argv[2], sys.argv[3], sys.argv[4])
+        else:
+            help()
